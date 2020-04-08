@@ -3,8 +3,9 @@ import pytest
 import time
 import sys
 import json
+import yaml
 from common import reboot
-from loganalyzer import LogAnalyzer, LogAnalyzerError
+from common.plugins.loganalyzer.loganalyzer import LogAnalyzer, LogAnalyzerError
 from datetime import datetime
 from check_critical_services import check_critical_services
 from check_daemon_status import check_pmon_daemon_status
@@ -18,6 +19,8 @@ BINARIES_DIR = os.path.join(BASE_DIR, 'binaries')
 TMP_DIR = os.path.basename('tmp')
 SUCCESS_CODE = 0
 FAILURE_CODE = -1
+
+PLATFORM_COMP_PATH_TEMPLATE = '/usr/share/sonic/device/{}/platform_components.json'
 
 FW_INSTALL_SUCCESS_LOG = "*.Firmware install ended * status=success*."
 UNVALID_NAME_LOG = '.*Invalid value for "<component_name>"*.'
@@ -35,7 +38,7 @@ class FwComponent(object):
     def get_version(self, dut, files_path, fw_data):
         raise NotImplemented
 
-    def update_fw(self, request, dut):
+    def update_fw(self, request):
         raise NotImplemented
 
     def check_version(self, version_to_install, comp_data):
@@ -76,6 +79,9 @@ class FwComponent(object):
 
 class BiosComponent(FwComponent):
 
+    def __init__(self, component_name):
+        self.__name = component_name
+
     def parse_version(self, files_path, file_name):
         fw_path = os.path.join(files_path, file_name)
         release_path = os.path.realpath(fw_path)
@@ -86,7 +92,6 @@ class BiosComponent(FwComponent):
                 fw_path = os.path.join(fw_path, file_name)
                 break
         return fw_path, ver
-
 
     def get_version(self, dut, files_path, fw_data):
         files_path = os.path.join(files_path, 'bios')
@@ -113,11 +118,16 @@ class BiosComponent(FwComponent):
                 'other_version': other_ver,
                 'other_path': other_fw_path,
         }
+        logger.info(
+            "{} parsed versions:\n{}".format(
+                self.get_component_name(),
+                json.dumps(versions, indent=4)
+            )
+        )
 
         return versions
 
-
-    def update_fw(self, request, dut):
+    def update_fw(self, request):
         """
         perform cold reboot to make bios installation finished.
         :param request
@@ -125,6 +135,7 @@ class BiosComponent(FwComponent):
         """
         testbed_device = request.getfixturevalue("testbed_devices")
         localhost = testbed_device['localhost']
+        dut = testbed_device['dut']
         reboot_ctrl_dict = {
             'command': 'reboot',
             'timeout': 600,
@@ -147,30 +158,15 @@ class BiosComponent(FwComponent):
             except Exception as e:
                 logging.error("Exception raised while cleanup reboot task and get result: " + repr(e))
 
+        # wait for dut to go up
         logging.info("Wait for DUT to come back")
-        localhost.wait_for(host=dut.hostname, port=22, state="started", delay=10, timeout=reboot_ctrl_dict['timeout'])
+        localhost.wait_for(host=dut.hostname, port=22, state="started", delay=10, timeout=300)
 
-        logging.info("Wait until all critical services are fully started")
-        check_critical_services(dut)
+        logging.info("Wait until system is stable")
+        wait_until(300, 30, dut.critical_services_fully_started)
 
-        logging.info("Check pmon daemon status")
-        assert check_pmon_daemon_status(dut), "Not all pmon daemons running."
-
-        if dut.facts['asic_type'] in ['mellanox']:
-            current_file_dir = os.path.dirname(os.path.realpath(__file__))
-            parent_dir = os.path.abspath(os.path.join(current_file_dir, os.pardir))
-            sub_folder_dir = os.path.join(parent_dir, "mellanox")
-            if sub_folder_dir not in sys.path:
-                sys.path.append(sub_folder_dir)
-            from check_hw_mgmt_service import check_hw_management_service
-            from check_sysfs import check_sysfs
-
-            logging.info("Check the hw-management service")
-            check_hw_management_service(dut)
-
-            logging.info("Check sysfs")
-            check_sysfs(dut)
-
+        # ensure system init is done
+        time.sleep(30)
 
     def check_version(self, version_to_install, comp_data):
         """
@@ -178,48 +174,65 @@ class BiosComponent(FwComponent):
         """
         if comp_data['version'].startswith(version_to_install):
             return SUCCESS_CODE
+
         return FAILURE_CODE
 
     def get_component_name(self):
-        return 'BIOS'
+        return self.__name
 
 
 class CpldComponent(FwComponent):
 
-    def parse_version(self, files_path, file_name, fw_data):
+    def __init__(self, component_name):
+        self.__name = component_name
+
+    def get_part_number(self, platform_type, files_path):
+        cpld_pn = None
+
+        conf_path = os.path.join(files_path, "{}/cpld_name_to_pn.yml".format(platform_type))
+        with open(conf_path, "r") as config:
+            cpld_name_to_pn_dict = yaml.safe_load(config)
+            cpld_pn = cpld_name_to_pn_dict[self.__name]
+
+        return cpld_pn
+
+    def parse_version(self, platform_type, files_path, file_name, fw_data):
         fw_path = os.path.join(files_path, file_name)
-        real_path = os.path.realpath(fw_path)
-        rev = os.path.basename(real_path).upper().split('REV')
-        revisions = []
-        counts = {}
-        is_latest = False
-        for i in range(len(rev)-1):
-            r = rev[i+1]
-            if r.startswith('_'):
-                r = r.split('_')[1]
-                revisions.append(int(r[0:2]))
-            elif '_' in r:
-                r = r.split('_')[0]
-                revisions.append(int(r[0:2]))
-            else:
-                r = r.split('.')[0]
-                revisions.append(int(r[0:2]))
+        real_fw_path = os.path.realpath(fw_path)
+        basename = os.path.basename(real_fw_path)
+        name = os.path.splitext(basename)[0]
+        rev = name.upper()
 
-        for r in revisions:
-            counts[r] = revisions.count(r)
+        # get CPLD part number
+        cpld_pn = self.get_part_number(platform_type, files_path)
 
-        current_counts = {}
-        current_ver = fw_data['CPLD']['version'].split('.')
-        for r in current_ver:
-            current_counts[int(r)] = current_ver.count(r)
+        if cpld_pn not in rev:
+            raise RuntimeError(
+                "Part number is not found: cpld={}, pn={}".format(
+                    self.__name,
+                    cpld_pn
+                )
+            )
 
-        if counts == current_counts:
-            is_latest = True
+        # parse CPLD version
+        cpld_ver = rev.split(cpld_pn)[1]
+        cpld_ver = cpld_ver[1:].split('_')[0]
+        cpld_ver_major = cpld_ver[:5]
+        cpld_ver_minor = cpld_ver[5:]
 
-        # TODO: for now returning only version and that is not latest
-        return fw_data['CPLD']['version'], False
-        # return counts, is_latest
+        # parse component version
+        comp_pn = fw_data[self.__name]['version'].split('_')[0]
+        comp_ver = fw_data[self.__name]['version'].split('_')[1]
+        comp_ver_major = comp_ver[:5]
+        comp_ver_minor = comp_ver[5:]
 
+        # TODO: Provide better way for handling minor version support
+        if int(comp_ver_minor) != 0:
+            parsed_ver = "{}_{}{}".format(comp_pn, cpld_ver_major, cpld_ver_minor)
+        else:
+            parsed_ver = "{}_{}00".format(comp_pn, cpld_ver_major)
+
+        return parsed_ver, cpld_ver_major == comp_ver_major
 
     def get_version(self, dut, files_path, fw_data):
         # currently taken from revisions but without known order
@@ -236,10 +249,10 @@ class CpldComponent(FwComponent):
 
         for file_name in os.listdir(files_path):
             if file_name.startswith(latest):
-                latest_ver, is_latest = self.parse_version(files_path, file_name, fw_data)
+                latest_ver, is_latest = self.parse_version(platform_type, files_path, file_name, fw_data)
                 latest_fw_path = os.path.join(files_path, file_name)
             if file_name.startswith(other):
-                other_ver, is_other = self.parse_version(files_path, file_name, fw_data)
+                other_ver, is_other = self.parse_version(platform_type, files_path, file_name, fw_data)
                 other_fw_path = os.path.join(files_path, file_name)
 
         versions = {
@@ -249,13 +262,23 @@ class CpldComponent(FwComponent):
             'other_version': other_ver,
             'other_path': other_fw_path
         }
+        logger.info(
+            "{} parsed versions:\n{}".format(
+                self.get_component_name(),
+                json.dumps(versions, indent=4)
+            )
+        )
+
         return versions
 
-
-    def update_fw(self, request, dut):
+    def update_fw(self, request):
         """
         performs 30 sec power cycle off to finish cpld installation.
         """
+        testbed_devices = request.getfixturevalue("testbed_devices")
+        localhost = testbed_devices['localhost']
+        dut = testbed_devices['dut']
+
         cmd_num_psu = "sudo psuutil numpsus"
         logging.info("Check how much PSUs DUT has")
         psu_num_out = dut.command(cmd_num_psu)
@@ -266,8 +289,7 @@ class CpldComponent(FwComponent):
             assert False, "Unable to get the number of PSUs using command '%s'" % cmd_num_psu
 
         logging.info("Create PSU controller for testing")
-        psu_c = request.getfixturevalue("psu_controller")
-        psu_control = psu_c(dut.hostname, dut.facts['asic_type'])
+        psu_control = request.getfixturevalue("psu_controller")
         if psu_control is None:
             pytest.fail("No PSU controller for %s, skip rest of the testing in this case" % dut.hostname)
         all_psu_status = psu_control.get_psu_status()
@@ -289,20 +311,26 @@ class CpldComponent(FwComponent):
                         time.sleep(5)
 
         # wait for dut to go up
-        time.sleep(20)
+        logging.info("Wait for DUT to come back")
+        localhost.wait_for(host=dut.hostname, port=22, state="started", delay=10, timeout=300)
 
+        logging.info("Wait until system is stable")
+        wait_until(300, 30, dut.critical_services_fully_started)
+
+        # ensure system init is done
+        time.sleep(30)
 
     def check_version(self, version_to_install, comp_data):
         """
         Check if there is version in comp data (TODO: when possible, check the cpld version)
         """
-        if comp_data['version']:
+        if comp_data['version'].startswith(version_to_install):
             return SUCCESS_CODE
+
         return FAILURE_CODE
 
-
     def get_component_name(self):
-        return 'CPLD'
+        return self.__name
 
 
 def fw_status(dut):
@@ -327,9 +355,11 @@ def get_output_data(dut):
     output_data = {}
     separators = re.split(r'\s{2,}', status_output.splitlines()[1])  # get separators
     output_lines = status_output.splitlines()[2:]
+
     for line in output_lines:
         data = []
         start = 0
+
         for sep in separators:
             curr_len = len(sep)
             data.append(line[start:start+curr_len].strip())
@@ -340,13 +370,17 @@ def get_output_data(dut):
             'version': data[3],
             'desc': data[4]
         }
+
     return output_data
 
 
-def execute_update_cmd(request, dut, cmd, component, version_to_install, component_object, expected_log):
+def execute_update_cmd(request, cmd, component, version_to_install, component_object, expected_log):
     """
     execute the recievd command on DUT, perform the final update, and check validation.
     """
+    testbed_devices = request.getfixturevalue("testbed_devices")
+    dut = testbed_devices['dut']
+
     loganalyzer = LogAnalyzer(ansible_host=dut, marker_prefix='acl')
     loganalyzer.load_common_config()
     try:
@@ -357,10 +391,10 @@ def execute_update_cmd(request, dut, cmd, component, version_to_install, compone
         raise err
 
     if result['rc'] != SUCCESS_CODE:
-        raise result['stderr']
+        pytest.fail("Update failed: msg={}".format(result['stderr']))
 
     # complete fw update - cold reboot if BIOS, power cycle with 30 sec timeout if CPLD
-    component_object.update_fw(request, dut)
+    component_object.update_fw(request)
 
     # check output of show command
     fw_data = get_output_data(dut)
@@ -368,7 +402,13 @@ def execute_update_cmd(request, dut, cmd, component, version_to_install, compone
     if not comp_data['version']:
         pytest.fail("Installation didn't work. Aborting!")
 
-    return component_object.check_version(version_to_install, comp_data)
+    if component_object.check_version(version_to_install, comp_data) != SUCCESS_CODE:
+        pytest.fail(
+            "Version check failed: current({}) != expected({})".format(
+                comp_data['version'],
+                version_to_install
+            )
+        )
 
 
 def execute_wrong_command(dut, cmd, expected_log):
@@ -403,53 +443,66 @@ def generate_components_file(dut, components_list, current_comp, path_to_install
             json_data['chassis'][platform_type]['component'][comp]['info'] = fw_data[comp]['desc']
 
     with open(os.path.join(BASE_DIR, "tmp_platform_components.json"), "w") as comp_file:
-        json.dump(json_data, comp_file)
+        json.dump(json_data, comp_file, indent=4)
 
     dst = "/usr/share/sonic/device/{}/platform_components.json".format(platform_type)
     dut.copy(src=os.path.join(BASE_DIR, "tmp_platform_components.json"), dest=dst)
 
 
-def update(request, dut, cmd, current_comp, path_to_install, version_to_install, comp_path, component_object):
+def update(request, cmd, current_comp, path_to_install, version_to_install, comp_path, component_object):
     """"
     Perform update command
     """
+    testbed_devices = request.getfixturevalue("testbed_devices")
+    dut = testbed_devices['dut']
+
     dut.copy(src=path_to_install, dest=comp_path)
-    update_code = execute_update_cmd(request, dut, cmd, current_comp, version_to_install, component_object, expected_log=FW_INSTALL_SUCCESS_LOG)
-    if update_code != SUCCESS_CODE:
-        pytest.fail("Update Failed. Aborting!")
 
-    dut.command("rm -rf {}".format(comp_path))
+    try:
+        execute_update_cmd(
+            request,
+            cmd,
+            current_comp,
+            version_to_install,
+            component_object,
+            expected_log=FW_INSTALL_SUCCESS_LOG
+        )
+    finally:
+        dut.command("rm -rf {}".format(comp_path))
 
 
-def update_from_current_img(request, dut, get_fw_path, components_list, component_object):
+def update_from_current_img(request, get_fw_path, components_list, component_object):
     """
     update from current image test case
     """
+    testbed_devices = request.getfixturevalue("testbed_devices")
+    dut = testbed_devices['dut']
+
     update_cmd = "fwutil update -y --image=current"
     current_component = get_fw_path['current_component']
     comp_path = os.path.join("/tmp", current_component)
     dut.command("mkdir -p {}".format(comp_path))
-    comp_path = os.path.join(comp_path, os.path.basename(get_fw_path['path_to_install']))
+    comp_path = os.path.join(comp_path, os.path.basename(get_fw_path['current_fw_path']))
 
-    generate_components_file(dut, components_list, current_comp=current_component,
-                                path_to_install=comp_path, version_to_install=get_fw_path['version_to_install'])
-
-    update(request, dut, update_cmd, current_comp=current_component,
-            path_to_install=get_fw_path['path_to_install'], version_to_install=get_fw_path['version_to_install'],
-            comp_path=comp_path, component_object=component_object)
-
-    if get_fw_path['is_latest_installed'] is True:
+    try:
+        generate_components_file(
+            dut,
+            components_list,
+            current_comp=current_component,
+            path_to_install=comp_path,
+            version_to_install=get_fw_path['previous_ver']
+        )
+        update(
+            request,
+            update_cmd,
+            current_comp=current_component,
+            path_to_install=get_fw_path['current_fw_path'],
+            version_to_install=get_fw_path['previous_ver'],
+            comp_path=comp_path,
+            component_object=component_object
+        )
+    finally:
         dut.command("rm -rf {}".format(comp_path))
-        comp_path = os.path.join("/tmp", current_component)
-        dut.command("mkdir -p {}".format(comp_path))
-        comp_path = os.path.join(comp_path, os.path.basename(get_fw_path['current_fw_path']))
-
-        generate_components_file(dut, components_list, current_comp=current_component,
-                                    path_to_install=comp_path, version_to_install=get_fw_path['previous_ver'])
-        update(request, dut, update_cmd, current_comp=current_component,
-                path_to_install=get_fw_path['current_fw_path'], version_to_install=get_fw_path['previous_ver'], comp_path=comp_path)
-
-    dut.command("rm -rf {}".format(comp_path))
 
 
 def get_image_info(dut):
@@ -485,6 +538,18 @@ def get_image_info(dut):
     return None
 
 
+def set_default_boot(request, dut):
+    """
+    Set current image as default.
+    """
+    image_info = get_image_info(dut)
+    current_image = image_info['current']
+
+    result = dut.command("sonic_installer set_default {}".format(current_image))
+    if result['rc'] != SUCCESS_CODE:
+        pytest.fail("Could not set default image {}. Aborting!".format(current_image))
+
+
 def set_next_boot(request, dut):
     """
     Set other available image as next.
@@ -513,42 +578,24 @@ def set_next_boot(request, dut):
         pytest.fail("Could not set image {} as next boot. Aborting!".format(next_img))
 
 
-
-def update_from_next_img(request, testbed_devices, get_fw_path, components_list, component_object):
+def update_from_next_img(request, get_fw_path, components_list, component_object):
     """
     update from next image test case.
     """
+    testbed_devices = request.getfixturevalue("testbed_devices")
     dut = testbed_devices['dut']
-    # setup
-    request.getfixturevalue('setup_images')
 
-    # generate component file for the current image
-    current_component = get_fw_path['current_component']
-    comp_path = os.path.join("/home/admin", current_component)
-    dut.command("mkdir -p {}".format(comp_path))
-    comp_path = os.path.join(comp_path, os.path.basename(get_fw_path['path_to_install']))
-
-    generate_components_file(dut, components_list, get_fw_path['current_component'],
-                                comp_path, get_fw_path['version_to_install'])
-
-    dut.copy(src=get_fw_path['path_to_install'], dest=comp_path)
-    command = "fwutil update -f -y"
-    update_code = execute_update_cmd(request, dut, cmd=command, component=get_fw_path['current_component'],
-                        version_to_install=get_fw_path['version_to_install'], component_object=component_object, expected_log=FW_INSTALL_SUCCESS_LOG)
-    if update_code != SUCCESS_CODE:
-        pytest.fail("Installation Failed. Aborting!")
-
-    image_info = get_image_info(dut)
-    next_boot_cmd = "sonic_installer set_next_boot {}".format(image_info['next'])
-    result = dut.command(next_boot_cmd)
-    if result['rc'] != SUCCESS_CODE:
-        pytest.fail("Could not execute command {}".format(next_boot_cmd))
+    set_next_boot(request, dut)
 
     next_img_cmd = "fwutil update -y --image=next"
-
-    update_code = execute_update_cmd(request, dut, cmd=next_img_cmd, component=get_fw_path['current_component'],
-                        version_to_install=get_fw_path['previous_ver'], component_object=component_object, expected_log=FW_INSTALL_SUCCESS_LOG)
-    dut.command("rm -rf {}".format(comp_path))
+    update_code = execute_update_cmd(
+        request,
+        cmd=next_img_cmd,
+        component=get_fw_path['current_component'],
+        version_to_install=get_fw_path['version_to_install'],
+        component_object=component_object,
+        expected_log=FW_INSTALL_SUCCESS_LOG
+    )
 
 
 def generate_invalid_structure_file(dut, components_list, chassis, platform_type, is_valid_comp_structure):
@@ -578,13 +625,14 @@ def generate_invalid_structure_file(dut, components_list, chassis, platform_type
     dut.copy(src=os.path.join(BASE_DIR, "tmp_platform_components.json"), dest=dst)
 
 
-
-def reboot_to_image(request, testbed_devices, image_type):
+def reboot_to_image(request, image_type):
     """
     set the recieved image as default and reboot
     """
+    testbed_devices = request.getfixturevalue("testbed_devices")
     dut = testbed_devices['dut']
     localhost = testbed_devices['localhost']
+
     # move to next image
     result = dut.command("sonic_installer set_default {}".format(image_type))
     if result['rc'] != SUCCESS_CODE:
@@ -609,8 +657,9 @@ def reboot_to_image(request, testbed_devices, image_type):
     logging.info("Wait until system is stable")
     wait_until(300, 30, dut.critical_services_fully_started)
 
+    # ensure system init is done
+    time.sleep(30)
+
     new_image_info = get_image_info(dut)
     if new_image_info['current'] != image_type:
         pytest.fail("Rebooting to {} image failed".format(image_type))
-
-    set_next_boot(request, dut)
